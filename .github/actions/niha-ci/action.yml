@@ -1,0 +1,158 @@
+name: 'niha CI governance check'
+description: |
+  Evaluate governance rules against a pull request, post the result as
+  a PR comment, and block the merge when blocked rules are found.
+
+  Assumes the `niha` CLI is available on PATH. Use the `setup-niha`
+  step in your workflow before invoking this action, or install via
+  `brew install --cask niha-and-co/tap/niha` (macOS runner) /
+  `npm install -g @niha-and-co/niha` (any runner).
+
+inputs:
+  api-key:
+    description: 'NIHA_API_KEY for authenticating against the Platform API. Required for production rule sets; mock mode is used when omitted.'
+    required: false
+  api-url:
+    description: 'Platform API base URL. Defaults to the production niha endpoint.'
+    required: false
+    default: 'https://api.niha.tech'
+  workspace-id:
+    description: 'Workspace ID whose effective rules drive the evaluation.'
+    required: false
+  fail-on:
+    description: |
+      Zone threshold at which the action exits non-zero and blocks the
+      merge. One of: `blocked` (default), `restricted`, `advisory`,
+      `never`. Use `never` to surface findings without blocking.
+    required: false
+    default: 'blocked'
+  comment:
+    description: |
+      Whether to post a PR comment with the evaluation result.
+      `true` (default) posts; `false` only logs to the step summary.
+    required: false
+    default: 'true'
+
+outputs:
+  decision:
+    description: 'PASS or FAIL — overall verdict.'
+    value: ${{ steps.evaluate.outputs.decision }}
+  passed:
+    description: 'Count of rules that passed.'
+    value: ${{ steps.evaluate.outputs.passed }}
+  advisory:
+    description: 'Count of rules in advisory state.'
+    value: ${{ steps.evaluate.outputs.advisory }}
+  blocked:
+    description: 'Count of rules in blocked state.'
+    value: ${{ steps.evaluate.outputs.blocked }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Evaluate governance rules
+      id: evaluate
+      shell: bash
+      env:
+        NIHA_API_KEY: ${{ inputs.api-key }}
+        NIHA_PLATFORM_API_URL: ${{ inputs.api-url }}
+        NIHA_WORKSPACE_ID: ${{ inputs.workspace-id }}
+        # When no API key is provided, fall back to mock mode so the
+        # pilot path stays usable in fork PRs where secrets aren't
+        # available.
+        NIHA_MOCK_API: ${{ inputs.api-key == '' && '1' || '' }}
+      run: |
+        set -euo pipefail
+        if ! command -v niha >/dev/null 2>&1; then
+          echo "::error::niha CLI not found on PATH. Install niha before invoking this action (brew/npm)."
+          exit 2
+        fi
+
+        # Capture trace + exit code without aborting the script.
+        set +e
+        niha check --ci --json > /tmp/niha-trace.json
+        check_exit=$?
+        set -e
+
+        # Surface verdict + counts as step outputs.
+        decision=$(jq -r '.result // "UNKNOWN"' /tmp/niha-trace.json)
+        passed=$(jq -r '.passed // 0' /tmp/niha-trace.json)
+        advisory=$(jq -r '.advisory // 0' /tmp/niha-trace.json)
+        blocked=$(jq -r '.blocked // 0' /tmp/niha-trace.json)
+
+        echo "decision=$decision" >> "$GITHUB_OUTPUT"
+        echo "passed=$passed" >> "$GITHUB_OUTPUT"
+        echo "advisory=$advisory" >> "$GITHUB_OUTPUT"
+        echo "blocked=$blocked" >> "$GITHUB_OUTPUT"
+
+        # Step summary — renders in the GitHub Actions UI even when
+        # the PR comment is disabled.
+        {
+          echo "## niha governance check"
+          echo ""
+          echo "| Verdict | Passed | Advisory | Blocked |"
+          echo "|---|---|---|---|"
+          echo "| **$decision** | $passed | $advisory | $blocked |"
+          echo ""
+          if [ "$blocked" -gt 0 ]; then
+            echo "### Blocked rules"
+            jq -r '.rules[] | select(.status == "blocked") | "- **\(.rule_id)** \(.name) — \(.message)"' /tmp/niha-trace.json
+            echo ""
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # Decide whether to fail this step. fail-on threshold:
+        #   blocked    — exit 1 only if blocked > 0
+        #   restricted — exit 1 if blocked OR advisory > 0
+        #   advisory   — same as restricted (alias)
+        #   never      — always exit 0; verdict is informational
+        threshold='${{ inputs.fail-on }}'
+        case "$threshold" in
+          never)
+            exit 0
+            ;;
+          advisory|restricted)
+            if [ "$blocked" -gt 0 ] || [ "$advisory" -gt 0 ]; then exit 1; fi
+            exit 0
+            ;;
+          blocked|*)
+            exit $check_exit
+            ;;
+        esac
+
+    - name: Post PR comment
+      if: ${{ inputs.comment == 'true' && github.event_name == 'pull_request' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        decision='${{ steps.evaluate.outputs.decision }}'
+        passed='${{ steps.evaluate.outputs.passed }}'
+        advisory='${{ steps.evaluate.outputs.advisory }}'
+        blocked='${{ steps.evaluate.outputs.blocked }}'
+
+        icon=$([ "$decision" = "PASS" ] && echo "✅" || echo "❌")
+
+        body=$(mktemp)
+        {
+          echo "$icon **niha governance check — $decision**"
+          echo ""
+          echo "| Passed | Advisory | Blocked |"
+          echo "|---|---|---|"
+          echo "| $passed | $advisory | $blocked |"
+          echo ""
+          if [ "$blocked" -gt 0 ]; then
+            echo "<details><summary>Blocked rules</summary>"
+            echo ""
+            jq -r '.rules[] | select(.status == "blocked") | "- **\(.rule_id)** \(.name) — \(.message)"' /tmp/niha-trace.json
+            echo ""
+            echo "</details>"
+          fi
+          echo ""
+          echo "_run by [niha CI action](https://github.com/niha-and-co/ai-platform/tree/main/.github/actions/niha-ci) · workflow: \`${{ github.workflow }}\`_"
+        } > "$body"
+
+        gh pr comment "${{ github.event.pull_request.number }}" \
+          --repo "${{ github.repository }}" \
+          --body-file "$body"
