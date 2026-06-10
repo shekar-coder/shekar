@@ -18,30 +18,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install niha CLI
+      - name: Install niha CLI from source
         run: |
-          npm install -g tsx
-          npm install -g @anthropic-ai/sdk
+          git clone https://github.com/niha-and-co/ai-platform.git /tmp/niha-platform
+          cd /tmp/niha-platform/src/cli-ink
+          npm install
+          npm run build
+          npm link
+          niha --version
 
-      - name: Run governance check
+      - name: Run niha governance check
         run: |
-          echo "Running niha governance check..."
           echo "API URL: $NIHA_PLATFORM_API_URL"
           echo "Workspace: $NIHA_WORKSPACE_ID"
           
-          RESULT=$(curl -s \
-            -H "X-API-Key: $NIHA_API_KEY" \
-            -H "X-Org-Id: $NIHA_WORKSPACE_ID" \
-            "$NIHA_PLATFORM_API_URL/api/v1/workspaces/$NIHA_WORKSPACE_ID/rules?limit=10")
-          
-          echo "Rules check result:"
-          echo "$RESULT" | head -5
-          
-          echo "### niha Governance Check" >> $GITHUB_STEP_SUMMARY
-          echo "✅ Governance API reachable via ngrok" >> $GITHUB_STEP_SUMMARY
-          echo "Workspace: $NIHA_WORKSPACE_ID" >> $GITHUB_STEP_SUMMARY
+          niha check --ci \
+            --workspace-id "$NIHA_WORKSPACE_ID" \
+            --api-url "$NIHA_PLATFORM_API_URL" \
+            --api-key "$NIHA_API_KEY" \
+            --json > /tmp/niha-result.json || true
+
+          cat /tmp/niha-result.json
+
+      - name: Post PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let result = {};
+            try { result = JSON.parse(fs.readFileSync('/tmp/niha-result.json', 'utf8')); } catch(e) {}
+            const score = result.score ?? 'n/a';
+            const decision = result.result ?? 'unknown';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `### niha Governance — ${decision}\n\nScore: **${score}**\n\n_niha CI check_`
+            });
